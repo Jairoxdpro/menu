@@ -1,13 +1,11 @@
--- Astra UI: standalone demo. No HTTP loading required.
-local UI = (function()
--- Astra UI 1.0 | Native Roblox UI, standalone Luau / ModuleScript.
+-- Astra UI 1.1 | Native Roblox UI, standalone Luau / ModuleScript.
 -- No network requests or dependencies. See README.md for the public API.
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 
-local Library = {Version = "1.0.0"}
+local Library = {Version = "1.1.0"}
 local Window = {}
 Window.__index = Window
 local Tab = {}
@@ -99,6 +97,13 @@ function Window:_callback(fn, value)
     local ok, err = pcall(fn, value)
     if not ok then warn("[AstraUI callback] " .. tostring(err)) end
 end
+function Window:_dispatchKeybinds(key)
+    local pending = table.clone(self.Keybinds)
+    for _, control in ipairs(pending) do
+        if self.Destroyed then break end
+        if not control.Tab.Destroyed and control.Value == key then self:_callback(control.Callback, control.Value) end
+    end
+end
 function Window:SetVisible(visible)
     assert(not self.Destroyed, "Window has been destroyed")
     self.Gui.Enabled = visible == true
@@ -142,6 +147,7 @@ end
 function Window:Destroy()
     if self.Destroyed then return end
     self.Destroyed = true
+    for index = #self.Tabs, 1, -1 do self.Tabs[index]:Destroy() end
     for _, c in ipairs(self.Connections) do c:Disconnect() end
     table.clear(self.Connections)
     self.Drag = nil
@@ -171,7 +177,9 @@ function Window:ImportConfig(json, fireCallbacks)
     for _, entry in ipairs(pending) do entry.Control:Set(entry.Value, true) end
     if fireCallbacks then
         for _, entry in ipairs(pending) do
-            if not entry.Control.ActionOnly then self:_callback(entry.Control.Callback, entry.Value) end
+            if not entry.Control.Tab.Destroyed and not entry.Control.ActionOnly then
+                self:_callback(entry.Control.Callback, entry.Value)
+            end
         end
     end
 end
@@ -386,18 +394,24 @@ function Library.CreateWindow(_library, options)
         if processed or UIS:GetFocusedTextBox() then return end
         if input.KeyCode.Name == self.ToggleKey then self:SetVisible(not self.Gui.Enabled); return end
         if not self.Gui.Enabled or self.Minimized then return end
-        for _, control in ipairs(self.Keybinds) do
-            if input.KeyCode.Name == control.Value then self:_callback(control.Callback, control.Value) end
-        end
+        self:_dispatchKeybinds(input.KeyCode.Name)
     end)
     return self
+end
+
+function Tab:_connect(signal, fn)
+    assert(not self.Destroyed and not self.Window.Destroyed, "Tab has been destroyed")
+    local connection = signal:Connect(fn)
+    table.insert(self.Connections, connection)
+    return connection
 end
 
 function Window:CreateTab(name)
     assert(not self.Destroyed, "Window has been destroyed")
     if type(name) == "table" then name = name.Name end
     name = tostring(name or "Tab")
-    local tab = setmetatable({Window = self, Name = name, Rows = {}}, Tab)
+    assert(name:match("%S"), "Tab name must not be blank")
+    local tab = setmetatable({Window = self, Name = name, Rows = {}, Connections = {}, Destroyed = false}, Tab)
     local order = #self.Tabs + 1
     tab.Button = button(self.Navigation, string.format("%02d   %s", order, name), {Name = "Tab_" .. name,
         Size = self.Narrow and UDim2.fromOffset(130, 38) or UDim2.new(1, 0, 0, 44),
@@ -410,13 +424,60 @@ function Window:CreateTab(name)
     make("UIPadding", {PaddingBottom = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), PaddingLeft = UDim.new(0, 1), PaddingTop = UDim.new(0, 1)}, tab.Page)
     list(tab.Page, 9)
     table.insert(self.Tabs, tab)
-    self:_connect(tab.Button.Activated, function() tab:Select() end)
+    tab:_connect(tab.Button.Activated, function() tab:Select() end)
     if order == 1 then tab:Select() end
     return tab
 end
+function Tab:SetName(name)
+    assert(not self.Destroyed and not self.Window.Destroyed, "Tab has been destroyed")
+    assert(type(name) == "string" and name:match("%S"), "Tab name must be a nonblank string")
+    self.Name = name
+    self.Button.Name = "Tab_" .. name
+    self.Page.Name = "Page_" .. name
+    self.Button.Text = string.format("%02d   %s", self.Button.LayoutOrder, name)
+    if self.Window.SelectedTab == self then self.Window.PageTitle.Text = name end
+    return self
+end
+function Tab:Destroy()
+    if self.Destroyed then return end
+    self.Destroyed = true
+    local window = self.Window
+    for _, connection in ipairs(self.Connections) do connection:Disconnect() end
+    table.clear(self.Connections)
+    if window.Capturing and window.Capturing.Tab == self then window:_cancelCapture() end
+    if window.SliderDrag and window.SliderDrag.Tab == self then window.SliderDrag = nil end
+    local focused = UIS:GetFocusedTextBox()
+    if focused and focused:IsDescendantOf(self.Page) then focused:ReleaseFocus() end
+    for flag, control in pairs(window.Flags) do
+        if control.Tab == self then window.Flags[flag] = nil end
+    end
+    for index = #window.Keybinds, 1, -1 do
+        if window.Keybinds[index].Tab == self then table.remove(window.Keybinds, index) end
+    end
+    local removedIndex = 1
+    for index, tab in ipairs(window.Tabs) do
+        if tab == self then removedIndex = index; table.remove(window.Tabs, index); break end
+    end
+    self.Button:Destroy()
+    self.Page:Destroy()
+    table.clear(self.Rows)
+    if not window.Destroyed then
+        for index, tab in ipairs(window.Tabs) do
+            tab.Button.LayoutOrder = index
+            tab.Button.Text = string.format("%02d   %s", index, tab.Name)
+        end
+    end
+    if window.SelectedTab == self then
+        window.SelectedTab = nil
+        if not window.Destroyed then
+            local nextTab = window.Tabs[math.min(removedIndex, #window.Tabs)]
+            if nextTab then nextTab:Select() else window.PageTitle.Text = "" end
+        end
+    end
+end
 function Tab:Select()
     local window = self.Window
-    assert(not window.Destroyed, "Window has been destroyed")
+    assert(not self.Destroyed and not window.Destroyed, "Tab has been destroyed")
     window:_cancelCapture()
     window.SelectedTab = self
     window.PageTitle.Text = self.Name
@@ -435,7 +496,7 @@ function Tab:_filter()
     end
 end
 function Tab:_row(options, height)
-    assert(not self.Window.Destroyed, "Window has been destroyed")
+    assert(not self.Destroyed and not self.Window.Destroyed, "Tab has been destroyed")
     if options.Flag then
         assert(type(options.Flag) == "string" and options.Flag ~= "", "Flag must be a nonempty string")
         assert(not self.Window.Flags[options.Flag], "Duplicate flag: " .. options.Flag)
@@ -455,10 +516,14 @@ function Tab:_row(options, height)
 end
 function Tab:_control(options, row, validate, render, initial)
     local window = self.Window
-    local c = {Instance = row, Validate = validate, Render = render, Callback = options.Callback}
-    function c:Get() return self.Value end
+    local tab = self
+    local c = {Instance = row, Tab = tab, Validate = validate, Render = render, Callback = options.Callback}
+    function c:Get()
+        assert(not tab.Destroyed and not window.Destroyed, "Control has been destroyed")
+        return self.Value
+    end
     function c:Set(value, silent)
-        assert(not window.Destroyed, "Window has been destroyed")
+        assert(not tab.Destroyed and not window.Destroyed, "Control has been destroyed")
         value = self.Validate(value)
         local changed = self.Value ~= value
         self.Value = value
@@ -480,11 +545,11 @@ function Tab:CreateParagraph(options)
         Size = UDim2.new(1, -28, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
         TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, TextTruncate = Enum.TextTruncate.None})
     local function reflow()
-        if not self.Window.Destroyed then
+        if not self.Destroyed and not self.Window.Destroyed then
             row.Size = UDim2.new(1, 0, 0, math.max(104, 53 + content.AbsoluteSize.Y))
         end
     end
-    self.Window:_connect(content:GetPropertyChangedSignal("AbsoluteSize"), reflow)
+    self:_connect(content:GetPropertyChangedSignal("AbsoluteSize"), reflow)
     reflow()
     return row
 end
@@ -492,8 +557,11 @@ function Tab:CreateButton(options)
     local row = self:_row(options)
     local b = button(row, options.ButtonText or "Run  →", {Name = "Action", Position = UDim2.new(0, 14, 1, -37),
         Size = UDim2.new(1, -28, 0, 28), TextColor3 = self.Window.Accent})
-    self.Window:_connect(b.Activated, function() self.Window:_callback(options.Callback) end)
-    return {Instance = row, Fire = function() self.Window:_callback(options.Callback) end}
+    self:_connect(b.Activated, function() self.Window:_callback(options.Callback) end)
+    return {Instance = row, Fire = function()
+        assert(not self.Destroyed and not self.Window.Destroyed, "Control has been destroyed")
+        self.Window:_callback(options.Callback)
+    end}
 end
 function Tab:CreateToggle(options)
     local window = self.Window
@@ -546,11 +614,11 @@ function Tab:CreateToggle(options)
             window:_tween(dot, {Position = UDim2.fromOffset(v and 46 or 4, 4), BackgroundColor3 = v and Theme.Text or Color3.fromRGB(187, 190, 208)})
             paintBorder()
         end, options.CurrentValue == true)
-    window:_connect(b.Activated, function() c:Set(not c:Get()) end)
-    window:_connect(b.MouseEnter, function() hovered = true; paintBorder() end)
-    window:_connect(b.MouseLeave, function() hovered = false; paintBorder() end)
-    window:_connect(b.SelectionGained, function() focused = true; paintBorder() end)
-    window:_connect(b.SelectionLost, function() focused = false; paintBorder() end)
+    self:_connect(b.Activated, function() c:Set(not c:Get()) end)
+    self:_connect(b.MouseEnter, function() hovered = true; paintBorder() end)
+    self:_connect(b.MouseLeave, function() hovered = false; paintBorder() end)
+    self:_connect(b.SelectionGained, function() focused = true; paintBorder() end)
+    self:_connect(b.SelectionLost, function() focused = false; paintBorder() end)
     return c
 end
 function Tab:CreateSlider(options)
@@ -584,12 +652,12 @@ function Tab:CreateSlider(options)
     local function update(x)
         if track.AbsoluteSize.X > 0 then c:Set(lo + math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1) * (hi - lo)) end
     end
-    self.Window:_connect(track.InputBegan, function(input)
+    self:_connect(track.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            self.Window.SliderDrag = {Input = input, Update = update}; update(input.Position.X)
+            self.Window.SliderDrag = {Input = input, Update = update, Tab = self}; update(input.Position.X)
         end
     end)
-    self.Window:_connect(track.InputBegan, function(input)
+    self:_connect(track.InputBegan, function(input)
         if input.KeyCode == Enum.KeyCode.Left or input.KeyCode == Enum.KeyCode.DPadLeft then c:Set(c:Get() - step) end
         if input.KeyCode == Enum.KeyCode.Right or input.KeyCode == Enum.KeyCode.DPadRight then c:Set(c:Get() + step) end
     end)
@@ -673,18 +741,18 @@ function Tab:CreateDropdown(options)
         end
         local entry = {Button = option, Mark = mark, Value = value, Hovered = false, Focused = false}
         table.insert(entries, entry)
-        window:_connect(option.MouseEnter, function() entry.Hovered = true; paint(entry) end)
-        window:_connect(option.MouseLeave, function() entry.Hovered = false; paint(entry) end)
-        window:_connect(option.SelectionGained, function() entry.Focused = true; paint(entry) end)
-        window:_connect(option.SelectionLost, function() entry.Focused = false; paint(entry) end)
-        window:_connect(option.Activated, function() c:Set(value); expand(false) end)
+        self:_connect(option.MouseEnter, function() entry.Hovered = true; paint(entry) end)
+        self:_connect(option.MouseLeave, function() entry.Hovered = false; paint(entry) end)
+        self:_connect(option.SelectionGained, function() entry.Focused = true; paint(entry) end)
+        self:_connect(option.SelectionLost, function() entry.Focused = false; paint(entry) end)
+        self:_connect(option.Activated, function() c:Set(value); expand(false) end)
         paint(entry)
     end
-    window:_connect(b.MouseEnter, function() hovered = true; selectorStyle() end)
-    window:_connect(b.MouseLeave, function() hovered = false; selectorStyle() end)
-    window:_connect(b.SelectionGained, function() hovered = true; selectorStyle() end)
-    window:_connect(b.SelectionLost, function() hovered = false; selectorStyle() end)
-    window:_connect(b.Activated, function() expand(not expanded) end)
+    self:_connect(b.MouseEnter, function() hovered = true; selectorStyle() end)
+    self:_connect(b.MouseLeave, function() hovered = false; selectorStyle() end)
+    self:_connect(b.SelectionGained, function() hovered = true; selectorStyle() end)
+    self:_connect(b.SelectionLost, function() hovered = false; selectorStyle() end)
+    self:_connect(b.Activated, function() expand(not expanded) end)
     return c
 end
 function Tab:CreateInput(options)
@@ -703,7 +771,7 @@ function Tab:CreateInput(options)
         TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false}, row)
     corner(box, 7); pad(box, 7)
     local c = self:_control(options, row, validate, function(v) box.Text = v end, initial)
-    self.Window:_connect(box.FocusLost, function() c:Set(box.Text) end)
+    self:_connect(box.FocusLost, function() c:Set(box.Text) end)
     return c
 end
 function Tab:CreateKeybind(options)
@@ -713,12 +781,12 @@ function Tab:CreateKeybind(options)
     local c = self:_control(options, row, keyName, function(v) b.Text = "[ " .. v .. " ]   Change key" end, initial)
     -- Binding changes do not invoke the action callback; pressing the bound key does.
     function c:Set(value)
-        assert(not self.Window.Destroyed, "Window has been destroyed")
+        assert(not self.Tab.Destroyed and not self.Window.Destroyed, "Control has been destroyed")
         self.Value = self.Validate(value); self.Render(self.Value)
     end
     c.Window = self.Window
     c.ActionOnly = true
-    self.Window:_connect(b.Activated, function()
+    self:_connect(b.Activated, function()
         if self.Window.Capturing then self.Window.Capturing.Render(self.Window.Capturing.Value) end
         self.Window.Capturing = c; b.Text = "Press a key…  (Esc to cancel)"
     end)
@@ -727,85 +795,3 @@ function Tab:CreateKeybind(options)
 end
 
 return Library
-
-end)()
-
-local window = UI:CreateWindow({
-    Name = "ASTRA",
-    Subtitle = "INTERFACE LIBRARY  /  01",
-    Accent = Color3.fromRGB(158, 127, 255),
-    ToggleKey = "RightShift",
-})
-
-local home = window:CreateTab("Home")
-home:CreateParagraph({
-    Title = "A space for your ideas.",
-    Content = "A lightweight Luau interface library. Explore the controls, connect your callbacks, and build your own panel.",
-})
-home:CreateSection("TRY THE CONTROLS")
-home:CreateToggle({
-    Name = "Notifications",
-    Description = "A toggle with state and a callback.",
-    Flag = "notifications",
-    CurrentValue = true,
-    Callback = function(value)
-        window:Notify({Title = "Preference updated", Content = value and "Notifications enabled." or "Notifications disabled."})
-    end,
-})
-home:CreateSlider({
-    Name = "Intensity",
-    Description = "Drag the slider or use arrow keys when selected.",
-    Flag = "intensity", Range = {0, 100}, Increment = 5, CurrentValue = 65, Suffix = "%",
-})
-home:CreateButton({
-    Name = "A little signal",
-    Description = "Display a sample notification.",
-    ButtonText = "Test notification  →",
-    Callback = function()
-        window:Notify({Title = "All connected", Content = "This button ran its callback successfully."})
-    end,
-})
-
-local components = window:CreateTab("Components")
-components:CreateSection("SELECTION & INPUT")
-components:CreateDropdown({
-    Name = "Profile", Description = "Choose an option from the list.",
-    Flag = "profile", Options = {"Balanced", "Creative", "Minimal"}, CurrentOption = "Balanced",
-    Callback = function(value) window:Notify({Title = "Profile", Content = value}) end,
-})
-components:CreateInput({
-    Name = "Project name", Description = "Changes are confirmed when the field loses focus.",
-    Flag = "project", CurrentValue = "My project", PlaceholderText = "Give it a name…", MaxLength = 60,
-})
-components:CreateKeybind({
-    Name = "Test shortcut", Description = "Press K to try it; click to assign a different key.",
-    Flag = "shortcut", CurrentKeybind = "K",
-    Callback = function(key) window:Notify({Title = "Shortcut triggered", Content = "Key: " .. key}) end,
-})
-
-local settings = window:CreateTab("Settings")
-settings:CreateParagraph({Title = "Make it yours.", Content = "-/+ folds and restores the window. X hides the menu. A and RightShift open or close it. Drag the header to move the window."})
-local saved
-settings:CreateButton({
-    Name = "Save configuration", Description = "Keep a JSON copy in memory for this session.", ButtonText = "Save a copy  →",
-    Callback = function()
-        saved = window:ExportConfig()
-        window:Notify({Title = "Copy saved", Content = "Values for all flagged controls have been saved."})
-    end,
-})
-settings:CreateButton({
-    Name = "Restore configuration", Description = "Restore values from the latest copy in this session.", ButtonText = "Restore copy  →",
-    Callback = function()
-        if saved then
-            window:ImportConfig(saved)
-            window:Notify({Title = "Copy restored", Content = "The controls have returned to their saved values."})
-        else
-            window:Notify({Title = "No saved copy yet", Content = "Save a configuration first."})
-        end
-    end,
-})
-settings:CreateButton({Name = "Unload interface", Description = "Destroy the window and disconnect its events.", ButtonText = "Close and clean up",
-    Callback = function() window:Destroy() end})
-
--- Optional handle for integration; remove the existing window before re-running.
-return window
